@@ -1,0 +1,144 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+// ---------- Pins ----------
+#define DHT_PIN     15
+#define DHT_TYPE    DHT22
+#define SD_CS        5
+#define OLED_W     128
+#define OLED_H      64
+#define OLED_ADDR  0x3C
+
+// ---------- Objects ----------
+DHT dht(DHT_PIN, DHT_TYPE);
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
+
+// ---------- Log record (data array) ----------
+struct Record {
+  uint32_t timestamp;   // seconds since start
+  float    temperature;
+  float    humidity;
+};
+
+#define BUF_SIZE 5
+Record buffer[BUF_SIZE];
+uint8_t bufCount = 0;
+uint32_t totalLogged = 0;
+bool sdOK = false;
+
+const char* LOG_FILE = "/datalog.csv";
+const unsigned long SAMPLE_MS = 2000;
+unsigned long lastSample = 0;
+
+// ---------- Write buffered array to SD over SPI ----------
+void flushBuffer() {
+  if (!sdOK || bufCount == 0) return;
+
+  File f = SD.open(LOG_FILE, FILE_APPEND);
+  if (!f) {
+    Serial.println("ERROR: cannot open log file");
+    return;
+  }
+  for (uint8_t i = 0; i < bufCount; i++) {
+    f.print(buffer[i].timestamp);   f.print(',');
+    f.print(buffer[i].temperature, 1); f.print(',');
+    f.println(buffer[i].humidity, 1);
+  }
+  f.close();
+  totalLogged += bufCount;
+  Serial.printf("Flushed %d records to SD (total %lu)\n", bufCount, totalLogged);
+  bufCount = 0;
+}
+
+// ---------- Update OLED over I2C ----------
+void showOLED(float t, float h, uint32_t ts) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Datalogger Node");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+  display.setCursor(0, 14);
+  display.printf("Temp : %.1f C\n", t);
+  display.printf("Humi : %.1f %%\n", h);
+  display.printf("Time : %lu s\n", ts);
+  display.printf("Logged: %lu\n", totalLogged + bufCount);
+  display.printf("SD   : %s", sdOK ? "OK" : "FAIL");
+
+  display.display();
+}
+
+// ---------- Print the log file to Serial (verification) ----------
+void dumpLog() {
+  File f = SD.open(LOG_FILE);
+  if (!f) return;
+  Serial.println("---- datalog.csv ----");
+  while (f.available()) Serial.write(f.read());
+  Serial.println("---------------------");
+  f.close();
+}
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+
+  // I2C OLED
+  Wire.begin(21, 22);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED init failed");
+    while (true) delay(1000);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+
+  // SPI storage (VSPI: SCK18, MISO19, MOSI23, CS5)
+  SPI.begin(18, 19, 23, SD_CS);
+  sdOK = SD.begin(SD_CS);
+  Serial.println(sdOK ? "SD card initialized (SPI OK)" : "SD init FAILED");
+
+  if (sdOK && !SD.exists(LOG_FILE)) {
+    File f = SD.open(LOG_FILE, FILE_WRITE);
+    if (f) {
+      f.println("timestamp_s,temperature_C,humidity_pct");
+      f.close();
+    }
+  }
+}
+
+void loop() {
+  if (millis() - lastSample >= SAMPLE_MS) {
+    lastSample = millis();
+
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (isnan(t) || isnan(h)) {
+      Serial.println("DHT read failed");
+      return;
+    }
+
+    uint32_t ts = millis() / 1000;
+
+    // 1) store in RAM array
+    buffer[bufCount++] = { ts, t, h };
+
+    // 2) show live reading on OLED (I2C)
+    showOLED(t, h, ts);
+    Serial.printf("[%lu s] T=%.1f C  H=%.1f %%\n", ts, t, h);
+
+    // 3) when array is full, log it to SPI storage
+    if (bufCount >= BUF_SIZE) {
+      flushBuffer();
+      if (totalLogged == 20) dumpLog();   // show file contents once
+    }
+  }
+}
